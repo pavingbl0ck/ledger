@@ -24,6 +24,9 @@ export function fmtShort(n) {
   return 'Rp ' + Math.round(abs)
 }
 
+// Alias used in Dashboard
+export const fmts = fmtShort
+
 export const MONTH_NAMES = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
 
 export const DEFAULT_CATS = [
