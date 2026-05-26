@@ -1,4 +1,3 @@
-// Simple PIN hashing using SubtleCrypto (no bcrypt dependency needed)
 export async function hashPin(pin) {
   const encoder = new TextEncoder()
   const data = encoder.encode('ledger_salt_v1_' + pin)
@@ -24,7 +23,6 @@ export function fmtShort(n) {
   return 'Rp ' + Math.round(abs)
 }
 
-// Alias used in Dashboard
 export const fmts = fmtShort
 
 export const MONTH_NAMES = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
