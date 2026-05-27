@@ -1,117 +1,139 @@
-import React, { useState } from 'react'
+import React, { useState, useRef } from 'react'
 import { supabase } from '../lib/supabase'
 import { MONTH_NAMES } from '../lib/utils'
 
-const MONTH_MAP = { JANUARI:0,FEBRUARI:1,MARET:2,APRIL:3,MEI:4,JUNI:5,
-  JULI:6,AGUSTUS:7,SEPTEMBER:8,OKTOBER:9,NOVEMBER:10,DESEMBER:11,
-  JANUARY:0,FEBRUARY:1,MARCH:2,APRIL:3,MAY:4,JUNE:5,
-  JULY:6,AUGUST:7,SEPTEMBER:8,OCTOBER:9,NOVEMBER:10,DECEMBER:11 }
-
-// Parse BCA-style statement text
-function parseBCAText(text, bankName, accountNo) {
-  const lines = text.split('\n').map(l => l.trim()).filter(Boolean)
-  const txns = []
-  let year = new Date().getFullYear()
-  let month = 'Jan'
-
-  // Detect period line: "PERIODE : JANUARI 2026"
-  for (const line of lines) {
-    const m = line.match(/PERIODE\s*:\s*(\w+)\s+(\d{4})/i)
-    if (m) {
-      const mo = MONTH_MAP[m[1].toUpperCase()]
-      if (mo !== undefined) month = MONTH_NAMES[mo]
-      year = parseInt(m[2])
-      break
-    }
-  }
-
-  // Row pattern: DD/MM  DESCRIPTION  AMOUNT DB|CR
-  const rowRe = /^(\d{2}\/\d{2})\s+(.+?)\s+([\d.,]+(?:\.\d{2})?)\s+(DB|CR)\s*$/
-  const amtRe = /^[\d.,]+(?:\.\d{2})?$/
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i]
-    const m = line.match(rowRe)
-    if (!m) continue
-    const [, date, desc, amtRaw, type] = m
-    const amount = parseFloat(amtRaw.replace(/\./g,'').replace(',','.'))
-    if (!isNaN(amount) && amount > 0) {
-      txns.push({ date, description: desc.trim(), type, amount, month, year, bank_name: bankName, account_no: accountNo, category_name: 'Uncategorized', note: '' })
-    }
-  }
-
-  // Fallback: try to parse tables where date, desc, amount are on separate lines
-  if (txns.length === 0) {
-    let i = 0
-    while (i < lines.length) {
-      const dateM = lines[i].match(/^(\d{2}\/\d{2})$/)
-      if (dateM && i + 1 < lines.length) {
-        const date = dateM[1]
-        // collect desc lines until we hit a line ending in DB/CR + amount
-        let desc = ''
-        let j = i + 1
-        while (j < lines.length) {
-          const amtLine = lines[j].match(/([\d.,]+(?:\.\d{2})?)\s+(DB|CR)/)
-          if (amtLine) {
-            const amount = parseFloat(amtLine[1].replace(/\./g,'').replace(',','.'))
-            const type = amtLine[2]
-            if (!isNaN(amount) && amount > 0) {
-              txns.push({ date, description: (desc + ' ' + lines[j].replace(amtLine[0],'')).trim().replace(/\s+/g,' '), type, amount, month, year, bank_name: bankName, account_no: accountNo, category_name:'Uncategorized', note:'' })
-            }
-            j++; break
-          }
-          desc += (desc ? ' ' : '') + lines[j]; j++
-        }
-        i = j
-      } else { i++ }
-    }
-  }
-
-  return txns
-}
-
 const OVERLAY = { position:'fixed', inset:0, background:'rgba(0,0,0,.5)', zIndex:100, display:'flex', alignItems:'center', justifyContent:'center', padding:'1rem' }
-const BOX = { background:'#fff', borderRadius:16, padding:'1.5rem', width:'100%', maxWidth:580, maxHeight:'90vh', overflowY:'auto', display:'flex', flexDirection:'column', gap:12 }
+const BOX = { background:'#fff', borderRadius:16, padding:'1.5rem', width:'100%', maxWidth:600, maxHeight:'92vh', overflowY:'auto', display:'flex', flexDirection:'column', gap:14 }
 const INPUT = { width:'100%', padding:'8px 10px', border:'1px solid #e0e0e0', borderRadius:8, fontSize:13, fontFamily:'inherit', outline:'none' }
-const BTN = (c='#1a1a1a',t='#fff') => ({ padding:'8px 18px', background:c, color:t, border:`1px solid ${c}`, borderRadius:8, fontSize:13, cursor:'pointer', fontFamily:'inherit', fontWeight:600 })
-const LABEL = { fontSize:11, fontWeight:600, color:'#555', marginBottom:3, display:'block' }
+const BTN = (c='#1a1a1a',t='#fff') => ({ padding:'9px 20px', background:c, color:t, border:`1px solid ${c==='#f5f5f3'?'#ddd':c}`, borderRadius:8, fontSize:13, cursor:'pointer', fontFamily:'inherit', fontWeight:600 })
+const LABEL = { fontSize:11, fontWeight:600, color:'#555', marginBottom:4, display:'block' }
+
+async function parsePDFWithClaude(base64PDF, bankName, accountNo) {
+  const prompt = `You are a bank statement parser. Extract ALL transactions from this ${bankName} bank statement PDF.
+
+Return ONLY a valid JSON array with no explanation, no markdown, no code fences. Each object must have exactly these fields:
+- date: string "DD/MM" format
+- description: string (the full transaction description)  
+- type: "DB" for debit/outgoing or "CR" for credit/incoming
+- amount: number (positive, no currency symbols, no dots as thousand separators - e.g. 5500000 not 5.500.000)
+- month: string 3-letter month abbreviation e.g. "Jan", "Feb", "Mar", "Apr"
+- year: number e.g. 2026
+- bank_name: "${bankName}"
+- account_no: "${accountNo}"
+- category_name: "Uncategorized"
+- note: ""
+
+Important:
+- Indonesian months: JANUARI=Jan, FEBRUARI=Feb, MARET=Mar, APRIL=Apr, MEI=May, JUNI=Jun, JULI=Jul, AGUSTUS=Aug, SEPTEMBER=Sep, OKTOBER=Oct, NOVEMBER=Nov, DESEMBER=Dec
+- Detect the month/year from the PERIODE line in the statement
+- Skip opening balance (SALDO AWAL) and closing balance (SALDO AKHIR) lines
+- Skip MUTASI CR/DB summary lines
+- Include interest (BUNGA) and fees (BIAYA ADM, PAJAK BUNGA)
+- For Indonesian amounts: periods are thousand separators, comma is decimal. So 5.500.000,00 = 5500000
+- Return ONLY the JSON array, nothing else`
+
+  const response = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 4000,
+      messages: [{
+        role: 'user',
+        content: [{
+          type: 'document',
+          source: { type: 'base64', media_type: 'application/pdf', data: base64PDF }
+        }, {
+          type: 'text',
+          text: prompt
+        }]
+      }]
+    })
+  })
+
+  if (!response.ok) {
+    const err = await response.json()
+    throw new Error(err.error?.message || `API error ${response.status}`)
+  }
+
+  const data = await response.json()
+  const text = data.content.map(b => b.text || '').join('').trim()
+  
+  // Strip any accidental markdown fences
+  const clean = text.replace(/^```json\s*/,'').replace(/^```\s*/,'').replace(/\s*```$/,'').trim()
+  
+  try {
+    const txns = JSON.parse(clean)
+    if (!Array.isArray(txns)) throw new Error('Response is not an array')
+    return txns
+  } catch(e) {
+    throw new Error('Could not parse Claude response as JSON. Try again.')
+  }
+}
 
 export function ImportModal({ workspaceId, onClose, onImported }) {
   const [bankName, setBankName] = useState('BCA')
   const [accountNo, setAccountNo] = useState('')
-  const [text, setText] = useState('')
   const [parsed, setParsed] = useState(null)
   const [loading, setLoading] = useState(false)
+  const [loadingMsg, setLoadingMsg] = useState('')
   const [err, setErr] = useState('')
   const [success, setSuccess] = useState('')
-  const [manualMonth, setManualMonth] = useState('')
-  const [manualYear, setManualYear] = useState(String(new Date().getFullYear()))
+  const [dragOver, setDragOver] = useState(false)
+  const [fileName, setFileName] = useState('')
+  const fileRef = useRef()
 
-  function handleParse() {
-    setErr(''); setSuccess('')
-    if (!text.trim()) { setErr('Paste statement text first'); return }
-    const txns = parseBCAText(text, bankName || 'Unknown Bank', accountNo)
+  async function handleFile(file) {
+    if (!file) return
+    if (file.type !== 'application/pdf') { setErr('Please upload a PDF file'); return }
+    if (file.size > 10 * 1024 * 1024) { setErr('File too large — max 10MB'); return }
+    
+    setFileName(file.name)
+    setErr(''); setParsed(null); setSuccess('')
+    setLoading(true)
+    setLoadingMsg('Reading PDF…')
 
-    // Override month/year if manually set
-    if (manualMonth) {
-      txns.forEach(t => { t.month = manualMonth; t.year = parseInt(manualYear) || t.year })
+    try {
+      // Convert to base64
+      const base64 = await new Promise((resolve, reject) => {
+        const reader = new FileReader()
+        reader.onload = e => resolve(e.target.result.split(',')[1])
+        reader.onerror = reject
+        reader.readAsDataURL(file)
+      })
+
+      setLoadingMsg('Sending to Claude AI to extract transactions…')
+      const txns = await parsePDFWithClaude(base64, bankName || 'Unknown Bank', accountNo)
+      
+      if (!txns.length) throw new Error('No transactions found in this PDF')
+      setParsed(txns)
+    } catch(ex) {
+      setErr('Error: ' + ex.message)
     }
-    if (txns.length === 0) setErr('No transactions found. Make sure the text is from a BCA statement (with dates like 01/01 and amounts ending in DB/CR).')
-    else setParsed(txns)
+    setLoading(false)
+    setLoadingMsg('')
+  }
+
+  function onDrop(e) {
+    e.preventDefault(); setDragOver(false)
+    handleFile(e.dataTransfer.files[0])
   }
 
   async function handleImport() {
     if (!parsed?.length) return
-    setLoading(true); setErr('')
+    setLoading(true); setLoadingMsg('Saving to database…'); setErr('')
     try {
       const rows = parsed.map(t => ({ ...t, workspace_id: workspaceId }))
-      const { error } = await supabase.from('transactions').insert(rows)
-      if (error) throw error
+      // Insert in batches of 50
+      for (let i = 0; i < rows.length; i += 50) {
+        const { error } = await supabase.from('transactions').insert(rows.slice(i, i+50))
+        if (error) throw error
+      }
       setSuccess(`✓ Imported ${rows.length} transactions from ${bankName}`)
-      setParsed(null); setText('')
-      onImported()
+      setParsed(null); setFileName('')
+      setTimeout(() => { onImported(); onClose() }, 1200)
     } catch (ex) { setErr('Import failed: ' + ex.message) }
-    setLoading(false)
+    setLoading(false); setLoadingMsg('')
   }
 
   return (
@@ -119,78 +141,102 @@ export function ImportModal({ workspaceId, onClose, onImported }) {
       <div style={BOX}>
         <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center' }}>
           <strong style={{ fontSize:16 }}>Import Bank Statement</strong>
-          <button onClick={onClose} style={{ background:'none', border:'none', fontSize:20, cursor:'pointer', color:'#888' }}>×</button>
+          <button onClick={onClose} style={{ background:'none', border:'none', fontSize:22, cursor:'pointer', color:'#888', lineHeight:1 }}>×</button>
         </div>
 
-        <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr 1fr 1fr', gap:8 }}>
-          <div style={{ gridColumn:'1/3' }}>
+        {/* Bank details */}
+        <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:10 }}>
+          <div>
             <label style={LABEL}>Bank name</label>
             <input style={INPUT} value={bankName} onChange={e=>setBankName(e.target.value)} placeholder="e.g. BCA, Mandiri, BRI" />
           </div>
-          <div style={{ gridColumn:'3/5' }}>
-            <label style={LABEL}>Account number</label>
-            <input style={INPUT} value={accountNo} onChange={e=>setAccountNo(e.target.value)} placeholder="Optional" />
-          </div>
           <div>
-            <label style={LABEL}>Override month</label>
-            <select style={INPUT} value={manualMonth} onChange={e=>setManualMonth(e.target.value)}>
-              <option value="">Auto-detect</option>
-              {MONTH_NAMES.map(m => <option key={m}>{m}</option>)}
-            </select>
-          </div>
-          <div>
-            <label style={LABEL}>Year</label>
-            <input style={INPUT} type="number" value={manualYear} onChange={e=>setManualYear(e.target.value)} placeholder="2026" />
+            <label style={LABEL}>Account number (optional)</label>
+            <input style={INPUT} value={accountNo} onChange={e=>setAccountNo(e.target.value)} placeholder="e.g. 7720962068" />
           </div>
         </div>
 
-        <div>
-          <label style={LABEL}>Paste statement text (copy from PDF / internet banking)</label>
-          <textarea style={{ ...INPUT, height:160, resize:'vertical', lineHeight:1.5 }}
-            value={text} onChange={e=>setText(e.target.value)}
-            placeholder="Paste the raw text of your bank statement here. The parser looks for lines with dates (DD/MM), descriptions, amounts and DB/CR markers." />
-        </div>
+        {/* PDF drop zone */}
+        {!parsed && !loading && (
+          <div
+            onDragOver={e=>{e.preventDefault();setDragOver(true)}}
+            onDragLeave={()=>setDragOver(false)}
+            onDrop={onDrop}
+            onClick={()=>fileRef.current.click()}
+            style={{
+              border: `2px dashed ${dragOver?'#1a1a1a':'#ddd'}`,
+              borderRadius: 12,
+              padding: '2.5rem 1rem',
+              textAlign: 'center',
+              cursor: 'pointer',
+              background: dragOver ? '#f5f5f3' : '#fafaf8',
+              transition: 'all .15s'
+            }}
+          >
+            <div style={{ fontSize:36, marginBottom:10 }}>📄</div>
+            <div style={{ fontWeight:600, fontSize:14, marginBottom:5 }}>
+              {fileName ? fileName : 'Drop your PDF here or click to browse'}
+            </div>
+            <div style={{ fontSize:12, color:'#999' }}>
+              BCA, Mandiri, BRI, or any Indonesian bank statement · Max 10MB
+            </div>
+            <input ref={fileRef} type="file" accept=".pdf,application/pdf" style={{ display:'none' }}
+              onChange={e=>handleFile(e.target.files[0])} />
+          </div>
+        )}
 
-        {err && <div style={{ background:'#fff0ed', color:'#993c1d', padding:'8px 12px', borderRadius:6, fontSize:12 }}>{err}</div>}
-        {success && <div style={{ background:'#e8f5ee', color:'#0f6e56', padding:'8px 12px', borderRadius:6, fontSize:12 }}>{success}</div>}
+        {/* Loading state */}
+        {loading && (
+          <div style={{ textAlign:'center', padding:'2rem', background:'#f5f5f3', borderRadius:12 }}>
+            <div style={{ fontSize:28, marginBottom:10 }}>⏳</div>
+            <div style={{ fontWeight:600, fontSize:14, marginBottom:5 }}>{loadingMsg}</div>
+            <div style={{ fontSize:12, color:'#999' }}>Claude AI is reading your PDF — this takes 10–20 seconds</div>
+          </div>
+        )}
 
-        {parsed && (
+        {/* Preview */}
+        {parsed && !loading && (
           <div>
-            <div style={{ fontSize:12, color:'#0f6e56', fontWeight:600, marginBottom:6 }}>
-              Found {parsed.length} transactions · Preview (first 5):
+            <div style={{ fontSize:13, color:'#0f6e56', fontWeight:600, marginBottom:8 }}>
+              ✓ Found {parsed.length} transactions — preview (first 6):
             </div>
             <table style={{ width:'100%', borderCollapse:'collapse', fontSize:11 }}>
               <thead>
                 <tr style={{ background:'#f5f5f3' }}>
-                  {['Date','Description','Type','Amount'].map(h => <th key={h} style={{ padding:'4px 6px', textAlign:'left', color:'#888', fontWeight:600 }}>{h}</th>)}
+                  {['Date','Month','Description','Type','Amount'].map(h =>
+                    <th key={h} style={{ padding:'5px 7px', textAlign:'left', color:'#888', fontWeight:600, fontSize:10, textTransform:'uppercase' }}>{h}</th>
+                  )}
                 </tr>
               </thead>
               <tbody>
-                {parsed.slice(0,5).map((t,i) => (
-                  <tr key={i} style={{ borderBottom:'1px solid #f0f0f0' }}>
-                    <td style={{ padding:'3px 6px' }}>{t.date}</td>
-                    <td style={{ padding:'3px 6px', maxWidth:200, overflow:'hidden', whiteSpace:'nowrap', textOverflow:'ellipsis' }}>{t.description}</td>
-                    <td style={{ padding:'3px 6px', color: t.type==='DB'?'#993c1d':'#0f6e56', fontWeight:600 }}>{t.type}</td>
-                    <td style={{ padding:'3px 6px', textAlign:'right' }}>Rp {Number(t.amount).toLocaleString('id-ID')}</td>
+                {parsed.slice(0,6).map((t,i) => (
+                  <tr key={i} style={{ borderBottom:'1px solid #f5f5f3' }}>
+                    <td style={{ padding:'4px 7px' }}>{t.date}</td>
+                    <td style={{ padding:'4px 7px', color:'#888' }}>{t.month} {t.year}</td>
+                    <td style={{ padding:'4px 7px', maxWidth:220, overflow:'hidden', whiteSpace:'nowrap', textOverflow:'ellipsis' }}>{t.description}</td>
+                    <td style={{ padding:'4px 7px', color: t.type==='DB'?'#993c1d':'#0f6e56', fontWeight:600 }}>{t.type}</td>
+                    <td style={{ padding:'4px 7px', textAlign:'right' }}>Rp {Number(t.amount).toLocaleString('id-ID')}</td>
                   </tr>
                 ))}
-                {parsed.length > 5 && <tr><td colSpan={4} style={{ padding:'4px 6px', color:'#888', fontSize:11 }}>…and {parsed.length-5} more</td></tr>}
+                {parsed.length > 6 && (
+                  <tr><td colSpan={5} style={{ padding:'5px 7px', color:'#999', fontSize:11, fontStyle:'italic' }}>…and {parsed.length-6} more transactions</td></tr>
+                )}
               </tbody>
             </table>
           </div>
         )}
 
+        {err && <div style={{ background:'#fff0ed', color:'#993c1d', padding:'9px 12px', borderRadius:8, fontSize:12 }}>{err}</div>}
+        {success && <div style={{ background:'#e8f5ee', color:'#0f6e56', padding:'9px 12px', borderRadius:8, fontSize:12, fontWeight:600 }}>{success}</div>}
+
         <div style={{ display:'flex', gap:8, justifyContent:'flex-end' }}>
           <button style={BTN('#f5f5f3','#1a1a1a')} onClick={onClose}>Cancel</button>
-          {!parsed
-            ? <button style={BTN()} onClick={handleParse}>Parse statement</button>
-            : <>
-                <button style={BTN('#f5f5f3','#1a1a1a')} onClick={()=>setParsed(null)}>Re-parse</button>
-                <button style={BTN('#0f6e56')} onClick={handleImport} disabled={loading}>
-                  {loading ? 'Importing…' : `Import ${parsed.length} rows`}
-                </button>
-              </>
-          }
+          {parsed && !loading && <>
+            <button style={BTN('#f5f5f3','#1a1a1a')} onClick={()=>{setParsed(null);setFileName('')}}>Upload different file</button>
+            <button style={BTN('#0f6e56')} onClick={handleImport}>
+              Import {parsed.length} transactions
+            </button>
+          </>}
         </div>
       </div>
     </div>
